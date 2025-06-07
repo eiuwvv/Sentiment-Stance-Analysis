@@ -1,0 +1,149 @@
+import pandas as pd
+from datasets import Dataset
+from transformers import (
+    AutoTokenizer, AutoModelForSequenceClassification,
+    TrainingArguments, Trainer, DataCollatorWithPadding
+)
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score
+import torch
+import torch.nn.functional as F
+import random
+import numpy as np
+import os
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+# --- 1. Install and import dependencies ---
+
+# --- 2. Load and reshape data ---
+DATA_FILE = "Annotated tweets.ods"
+ENTITY_MAP = {
+    'stance_toward_luigi': 'Luigi Mangione',
+    'stance_toward_brian': 'Brian Thompson',
+    'stance_toward_united': 'UnitedHealthcare'
+}
+VALID_STANCES = ['favor', 'neutral', 'against']
+STANCE_LABEL_MAP = {'favor': 0, 'neutral': 1, 'against': 2}
+LABEL_MAP = {0: "favor", 1: "neutral", 2: "against"}
+
+def load_data(filename):
+    try:
+        df = pd.read_excel(filename, engine="odf")
+    except Exception as e:
+        print(f"Error reading file {filename}: {e}")
+        raise
+    return df
+
+def reshape_data(df):
+    long_df = df.melt(
+        id_vars=['text'],
+        value_vars=ENTITY_MAP.keys(),
+        var_name='stance_column',
+        value_name='stance'
+    ).dropna(subset=['stance'])
+    long_df['entity'] = long_df['stance_column'].map(ENTITY_MAP)
+    long_df['text_with_entity'] = long_df.apply(
+        lambda row: row['text'].replace(row['entity'], f"</s>{row['entity']}</s>")
+        if row['entity'] in row['text']
+        else f"</s>{row['entity']}</s> {row['text']}", axis=1
+    )
+    long_df = long_df[long_df['stance'].isin(VALID_STANCES)].copy()
+    long_df['label'] = long_df['stance'].map(STANCE_LABEL_MAP)
+    return long_df
+
+def filter_length(df, tokenizer, max_length=512):
+    def is_short_enough(example):
+        return len(tokenizer(example["text_with_entity"])["input_ids"]) <= max_length
+    return df[df["text_with_entity"].apply(lambda x: is_short_enough({"text_with_entity": x}))]
+
+# --- 3. Train/validation split ---
+def train_val_split(df, test_size=0.15, seed=42):
+    train_df, val_df = train_test_split(
+        df[['text_with_entity', 'label', 'entity', 'text']],
+        test_size=test_size,
+        stratify=df['label'],
+        random_state=seed
+    )
+    return (
+        Dataset.from_pandas(train_df.reset_index(drop=True)),
+        Dataset.from_pandas(val_df.reset_index(drop=True))
+    )
+
+# --- 4. Tokenization ---
+def tokenize_batch(tokenizer):
+    def tokenize(batch):
+        return tokenizer(batch['text_with_entity'], padding=True, truncation=True)
+    return tokenize
+
+# --- 5. Model & training config (CPU-friendly) ---
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = torch.argmax(torch.tensor(logits), dim=-1)
+    return {
+        "accuracy": accuracy_score(labels, preds),
+        "f1": f1_score(labels, preds, average="macro")
+    }
+
+def train_model(model_name, train_ds, val_ds, output_dir="./stance_model", epochs=4, batch_size=8):
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=3)
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        num_train_epochs=epochs,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        logging_dir=os.path.join(output_dir, "logs"),
+        logging_steps=10,
+        load_best_model_at_end=True,
+        fp16=False
+    )
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
+        tokenizer=AutoTokenizer.from_pretrained(model_name),
+        data_collator=DataCollatorWithPadding(AutoTokenizer.from_pretrained(model_name)),
+        compute_metrics=compute_metrics
+    )
+    trainer.train()
+    return trainer
+
+# --- 6. Save final model ---
+def save_model(trainer, output_dir="./stance_model_final"):
+    trainer.save_model(output_dir)
+
+# --- 7. Inference example ---
+def predict(model, tokenizer, text, entity):
+    input_text = f"</s>{entity}</s> {text}"
+    inputs = tokenizer(input_text, return_tensors="pt", truncation=True)
+    outputs = model(**inputs)
+    probs = F.softmax(outputs.logits, dim=1)
+    pred = torch.argmax(outputs.logits, dim=1).item()
+    print("Prediction:", LABEL_MAP[pred])
+    print("Probabilities:", {LABEL_MAP[i]: float(prob) for i, prob in enumerate(probs[0])})
+
+if __name__ == "__main__":
+    set_seed(42)
+    df = load_data(DATA_FILE)
+    long_df = reshape_data(df)
+    model_name = "cardiffnlp/twitter-roberta-base-sentiment-latest"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    long_df = filter_length(long_df, tokenizer)
+    train_ds, val_ds = train_val_split(long_df)
+    train_ds = train_ds.map(tokenize_batch(tokenizer), batched=True)
+    val_ds = val_ds.map(tokenize_batch(tokenizer), batched=True)
+    trainer = train_model(model_name, train_ds, val_ds)
+    save_model(trainer)
+    # Inference Example
+    model = trainer.model
+    example_text = "He really deserves to be arrested."
+    example_entity = "Luigi Mangione"
+    predict(model, tokenizer, example_text, example_entity)
